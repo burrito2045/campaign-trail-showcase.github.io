@@ -1,20 +1,369 @@
 let loadingFromModButton = false;
-const UNFAV = "♥";
-const FAV = "♡";
-const PLAY = "▶";
-const DELETE = "X";
+const UNFAV = `<svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" style="vertical-align: middle; transform: translateY(-1.5px);"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>`;
+const FAV = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle; transform: translateY(-1.5px) scale(0.9); transform-origin: center;"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>`;
+const PLAY = `<svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" style="vertical-align: middle; transform: translateY(-1px);"><path d="M8 5v14l11-7z"/></svg>`;
+const DELETE = `<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle; transform: translateY(-1px);"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
 const NEW_RELEASE = "new";
 const ALL = "all";
 
 const modList = [];
+const modMap = new Map();
 const tagList = [];
+let originalModsData = [];
 
 let customMods = new Set();
 let customMod = false;
+window.customMod = false;
 let favoriteMods = new Set();
 
 let onlyFavorites = false;
 let showAllModsLegacy = false;
+
+// cache and observer for lazy loading metadata
+const metadataCache = new Map();
+const loadedMetadataMods = new Set();
+window.loadedMetadataMods = loadedMetadataMods;
+
+const metadataObserver = new IntersectionObserver((entries, observer) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const modView = entry.target;
+      const modName = modView.getAttribute("mod-name");
+
+      // stop observing once we begin loading its metadata
+      observer.unobserve(modView);
+
+      triggerLazyLoad(modView, modName);
+    }
+  });
+}, { rootMargin: "200px" });
+
+async function getModMetadata(modName) {
+  if (metadataCache.has(modName)) {
+    return metadataCache.get(modName);
+  }
+
+  // if it's a local mod, retrieve metadata from indexedDB
+  if (customMods.has(modName)) {
+    try {
+      const modData = await getModFromDB(modName);
+      if (modData && modData.code1) {
+        const temp = extractElectionDetails(modData.code1, modName);
+        extractModMetadata(modData.code1, modName);
+
+        const imageUrl = temp?.election_json?.[0]?.fields?.site_image ?? temp?.election_json?.[0]?.fields?.image_url ?? "";
+        const description = temp?.election_json?.[0]?.fields?.site_description ?? temp?.election_json?.[0]?.fields?.summary ?? "";
+
+        const metadata = { imageUrl, description };
+        metadataCache.set(modName, metadata);
+        return metadata;
+      }
+    } catch (e) {
+      console.error(`Error loading metadata for custom mod ${modName}:`, e);
+    }
+    return {
+      imageUrl: "",
+      description: `<h1 style="color:red">FAILED TO LOAD LOCAL MOD INFO</h1>`
+    };
+  }
+
+  // otherwise, perform standard fetch from server
+  try {
+    const res = await fetch(`../static/mods/${modName}_init.html`);
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const rawModText = await res.text();
+
+    const temp = extractElectionDetails(rawModText, modName);
+    extractModMetadata(rawModText, modName);
+
+    let imageUrl = "";
+    let description = "";
+
+    if (temp?.election_json?.length > 0 && temp.election_json[0].fields) {
+      imageUrl = temp.election_json[0].fields.site_image ?? temp.election_json[0].fields.image_url ?? "";
+      description = temp.election_json[0].fields.site_description ?? temp.election_json[0].fields.summary ?? "";
+    } else {
+      description = `<h1 style="color:red">COULD NOT GET CODE 1 PLEASE ALERT DEV!</h1>`;
+    }
+
+    const metadata = { imageUrl, description };
+    metadataCache.set(modName, metadata);
+    return metadata;
+  } catch (error) {
+    console.error(`Error loading metadata for ${modName}:`, error);
+    return {
+      imageUrl: "",
+      description: `<h1 style="color:red">FAILED TO LOAD MOD INFO</h1>`
+    };
+  }
+}
+
+async function triggerLazyLoad(modView, modName) {
+  const meta = await getModMetadata(modName);
+  if (!meta) return;
+
+  if (modView._elements.image && meta.imageUrl) {
+    modView._elements.image.src = meta.imageUrl;
+  }
+  if (modView._elements.desc) {
+    modView._elements.desc.innerHTML = meta.description;
+  }
+
+  applySingleModTheme(modView);
+  getFavsAndPlayCount(modName, modView);
+}
+
+// mod view template
+const modViewTemplate = document.createElement('template');
+modViewTemplate.innerHTML = `
+  <div class="community-grid-element">
+    <div class="mod-title"><p></p></div>
+    <div class="mod-img-desc">
+      <img class="mod-image" loading="lazy" alt="">
+      <div class="mod-desc"></div>
+    </div>
+    <div class="hover-button-holder">
+      <button class="mod-play-button hover-button"><span></span></button>
+      <button class="hover-button fav-button"><span></span></button>
+      <button class="hover-button delete-button" style="display:none"><span></span></button>
+    </div>
+    <div class="rating-background">
+      <div class="modRating">LOADING FAVORITES...</div>
+      <div class="modPlayCount">LOADING PLAYS...</div>
+    </div>
+  </div>
+`;
+
+// IndexedDB setup
+const DB_NAME = "CTSUserMods";
+const DB_VERSION = 1;
+const STORE_NAME = "customMods";
+let db = null;
+let useIndexedDB = true;
+
+// initialize IndexedDB
+async function initDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onerror = () => {
+      console.warn("IndexedDB failed to open, falling back to localStorage");
+      useIndexedDB = false;
+      resolve(null);
+    };
+
+    request.onsuccess = (event) => {
+      db = event.target.result;
+      useIndexedDB = true;
+      resolve(db);
+    };
+
+    request.onupgradeneeded = (event) => {
+      const database = event.target.result;
+      if (!database.objectStoreNames.contains(STORE_NAME)) {
+        database.createObjectStore(STORE_NAME, { keyPath: "name" });
+      }
+    };
+  });
+}
+
+// save mod to IndexedDB
+async function saveModToDB(modName, code1, code2) {
+  if (!useIndexedDB || !db) {
+    // fallback to localStorage
+    localStorage.setItem(modName + "_code1", code1);
+    localStorage.setItem(modName + "_code2", code2);
+    return;
+  }
+
+  return new Promise((resolve, reject) => {
+    try {
+      const transaction = db.transaction([STORE_NAME], "readwrite");
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put({
+        name: modName,
+        code1: code1,
+        code2: code2 || "" // safety fallback
+      });
+
+      transaction.oncomplete = () => {
+        resolve();
+      };
+
+      transaction.onerror = (e) => {
+        console.warn(`Transaction failed for ${modName}:`, e);
+        // fallback to localStorage
+        localStorage.setItem(modName + "_code1", code1);
+        localStorage.setItem(modName + "_code2", code2 || "");
+        resolve();
+      };
+    } catch (e) {
+      console.error("DB error during save:", e);
+      resolve(); // resolve anyway to prevent app hang
+    }
+  });
+}
+
+// get mod from IndexedDB
+async function getModFromDB(modName) {
+  if (!useIndexedDB || !db) {
+    // fallback to localStorage
+    const code1 = localStorage.getItem(modName + "_code1");
+    const code2 = localStorage.getItem(modName + "_code2");
+    return code1 ? { name: modName, code1, code2 } : null;
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], "readonly");
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(modName);
+
+    request.onsuccess = () => {
+      if (request.result) {
+        resolve(request.result);
+      } else {
+        // try number fallback for legacy numeric keys
+        if (!isNaN(modName) && modName !== "") {
+          const numRequest = store.get(Number(modName));
+          numRequest.onsuccess = () => {
+            if (numRequest.result) {
+              resolve(numRequest.result);
+            } else {
+              fallbackToLocal();
+            }
+          };
+          numRequest.onerror = () => fallbackToLocal();
+        } else {
+          fallbackToLocal();
+        }
+      }
+    };
+
+    function fallbackToLocal() {
+      // fallback to localStorage
+      const code1 = localStorage.getItem(modName + "_code1");
+      const code2 = localStorage.getItem(modName + "_code2");
+      resolve(code1 ? { name: modName, code1, code2 } : null);
+    }
+    request.onerror = () => {
+      // fallback to localStorage
+      const code1 = localStorage.getItem(modName + "_code1");
+      const code2 = localStorage.getItem(modName + "_code2");
+      resolve(code1 ? { name: modName, code1, code2 } : null);
+    };
+  });
+}
+
+// delete mod from IndexedDB
+async function deleteModFromDB(modName) {
+  if (!useIndexedDB || !db) {
+    // fallback to localStorage
+    localStorage.removeItem(modName + "_code1");
+    localStorage.removeItem(modName + "_code2");
+    return;
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.delete(modName);
+    
+    // try to delete numeric key if it exists, to fix legacy bugs
+    if (!isNaN(modName) && modName !== "") {
+      try { store.delete(Number(modName)); } catch (e) {}
+    }
+
+    request.onsuccess = () => {
+      // also remove from localStorage as cleanup
+      localStorage.removeItem(modName + "_code1");
+      localStorage.removeItem(modName + "_code2");
+      resolve();
+    };
+    request.onerror = () => {
+      console.warn(`Failed to delete ${modName} from IndexedDB`);
+      localStorage.removeItem(modName + "_code1");
+      localStorage.removeItem(modName + "_code2");
+      resolve();
+    };
+  });
+}
+
+// get all custom mod names from IndexedDB
+async function getAllCustomModNames() {
+  if (!useIndexedDB || !db) {
+    // fallback to localStorage
+    const stored = localStorage.getItem("customMods");
+    return stored ? stored.split(",") : [];
+  }
+
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], "readonly");
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.getAllKeys();
+
+    request.onsuccess = () => {
+      resolve((request.result || []).map(String));
+    };
+    request.onerror = () => {
+      // Fallback to localStorage
+      const stored = localStorage.getItem("customMods");
+      resolve(stored ? stored.split(",") : []);
+    };
+  });
+}
+
+// save custom mod names list
+async function saveCustomModNames(modNames) {
+  // always keep in localStorage for quick access
+  const modNamesArray = modNames instanceof Set ? Array.from(modNames) : Array.from(modNames || []);
+  if (modNamesArray.length === 0) {
+    localStorage.removeItem("customMods");
+  } else {
+    localStorage.setItem("customMods", modNamesArray.join(","));
+  }
+}
+
+// migrate localStorage mods to IndexedDB
+async function migrateLocalStorageToIndexedDB() {
+  const migrationDone = localStorage.getItem("indexedDBMigrationDone");
+  if (migrationDone === "true") {
+    return; // already migrated
+  }
+
+  const customModsStr = localStorage.getItem("customMods");
+  if (!customModsStr) {
+    localStorage.setItem("indexedDBMigrationDone", "true");
+    return;
+  }
+
+  const modNames = customModsStr.split(",");
+  console.log(`Migrating ${modNames.length} mods from localStorage to IndexedDB...`);
+
+  for (const modName of modNames) {
+    const code1 = localStorage.getItem(modName + "_code1");
+    const code2 = localStorage.getItem(modName + "_code2");
+
+    if (code1) {
+      await saveModToDB(modName, code1, code2 || "");
+
+      // check if DB is active, then remove legacy data to free up quota
+      if (useIndexedDB && db) {
+        localStorage.removeItem(modName + "_code1");
+        localStorage.removeItem(modName + "_code2");
+      }
+
+      console.log(`Migrated ${modName} to IndexedDB`);
+    }
+  }
+
+  try {
+    localStorage.setItem("indexedDBMigrationDone", "true");
+    console.log("Migration complete!");
+  } catch (e) {
+    console.warn("Could not set migration flag after cleanup:", e);
+  }
+}
+
 try {
   const legacyView = localStorage.getItem("showAllModsLegacy");
   if (legacyView !== null) {
@@ -47,46 +396,46 @@ const customThemesButton = document.getElementById("customThemesButton");
 
 let customModBoxThemes = {};
 
-// check if the modThemeState is set in localStorage
-if (localStorage.getItem("modThemeState") === null) {
+let currentModThemeState = localStorage.getItem("modThemeState");
+if (currentModThemeState === null) {
   // if not, check for the legacy 'customModBoxThemesEnabled' setting
   const legacyThemeState = localStorage.getItem("customModBoxThemesEnabled");
 
   if (legacyThemeState !== null) {
     // migration time!
     // 'true' maps to 'default', and 'false' maps to 'off'
-    const newThemeState = legacyThemeState === "true" ? "default" : "off";
-    localStorage.setItem("modThemeState", newThemeState);
+    currentModThemeState = legacyThemeState === "true" ? "default" : "off";
+    localStorage.setItem("modThemeState", currentModThemeState);
 
     // remove old key
     localStorage.removeItem("customModBoxThemesEnabled");
   } else {
     // initialize with default
-    localStorage.setItem("modThemeState", "default");
+    currentModThemeState = "default";
+    localStorage.setItem("modThemeState", currentModThemeState);
   }
 }
 
-function updateButtonText() {
-  const state = localStorage.getItem("modThemeState");
-  if (state === "off") {
+function updateModThemesButtonText() {
+  if (currentModThemeState === "off") {
     customThemesButton.innerText = "Mod Themes: Off";
-  } else if (state === "default") {
+  } else if (currentModThemeState === "default") {
     customThemesButton.innerText = "Mod Themes: Default";
   } else {
     customThemesButton.innerText = "Mod Themes: Detailed";
   }
 }
-updateButtonText();
+updateModThemesButtonText();
 
 const themeStates = ["off", "default", "detailed"];
 
 function toggleModBoxThemes() {
-  const currentState = localStorage.getItem("modThemeState");
-  const currentIndex = themeStates.indexOf(currentState);
+  const currentIndex = themeStates.indexOf(currentModThemeState);
   const nextIndex = (currentIndex + 1) % themeStates.length;
-  localStorage.setItem("modThemeState", themeStates[nextIndex]);
+  currentModThemeState = themeStates[nextIndex];
+  localStorage.setItem("modThemeState", currentModThemeState);
 
-  updateButtonText();
+  updateModThemesButtonText();
   applyModBoxThemes();
 }
 
@@ -96,110 +445,163 @@ function applyStyle(element, property, value) {
   }
 }
 
-function applyModBoxThemes() {
-  const state = localStorage.getItem("modThemeState");
+function applySingleModTheme(modView, state = null) {
+  state = state || currentModThemeState;
+  const modName = modView.getAttribute("mod-name");
+  const theme = customModBoxThemes[modName];
+  let applyTheme = false;
 
-  modList.forEach(modView => {
-    const modName = modView.getAttribute("mod-name");
-    const theme = customModBoxThemes[modName];
-    let applyTheme = false;
+  if (state === "default" && theme && !theme._isFallback) {
+    applyTheme = true;
+  } else if (state === "detailed" && theme) {
+    applyTheme = true;
+  }
 
-    if (state === "default" && theme && !theme._isFallback) {
-      applyTheme = true;
-    } else if (state === "detailed" && theme) {
-      applyTheme = true;
+  if (applyTheme) {
+    theme.header_image_url ? modView.style.setProperty("--theme-header-bg", `url('${theme.header_image_url}')`) : modView.style.removeProperty("--theme-header-bg");
+    theme.header_color ? modView.style.setProperty("--theme-header-color", theme.header_color) : modView.style.removeProperty("--theme-header-color");
+    theme.header_text_color ? modView.style.setProperty("--theme-header-text", theme.header_text_color) : modView.style.removeProperty("--theme-header-text");
+    theme.description_background_color ? modView.style.setProperty("--theme-desc-bg", theme.description_background_color) : modView.style.removeProperty("--theme-desc-bg");
+    theme.description_text_color ? modView.style.setProperty("--theme-desc-text", theme.description_text_color) : modView.style.removeProperty("--theme-desc-text");
+    theme.main_color ? modView.style.setProperty("--theme-main-color", theme.main_color) : modView.style.removeProperty("--theme-main-color");
+    theme.secondary_color ? modView.style.setProperty("--theme-secondary-color", theme.secondary_color) : modView.style.removeProperty("--theme-secondary-color");
+    
+    let hoverColor = theme.secondary_hover_color;
+    if (!hoverColor && theme.secondary_color) {
+      const lum = getContrastRatio(theme.secondary_color, '#fff');
+      hoverColor = lum < 3 ? mixColor(theme.secondary_color, '#000', 0.15) : mixColor(theme.secondary_color, '#fff', 0.15);
     }
+    hoverColor ? modView.style.setProperty("--theme-secondary-hover", hoverColor) : modView.style.removeProperty("--theme-secondary-hover");
 
-    const modTitle = modView.querySelector(".mod-title");
-    const modDesc = modView.querySelector(".mod-desc");
-    const buttons = modView.querySelectorAll(".hover-button");
-    const ratingBg = modView.querySelector(".rating-background");
-
-    if (applyTheme) {
-      if (modTitle) {
-        modTitle.style.background = `url('${theme.header_image_url ?? ""}')`;
-        applyStyle(modTitle, "backgroundColor", theme.header_color);
-        applyStyle(modTitle.querySelector("p"), "color", theme.header_text_color);
-      }
-      if (modDesc) {
-        applyStyle(modDesc, "backgroundColor", theme.description_background_color);
-        applyStyle(modDesc, "color", theme.description_text_color);
-      }
-      applyStyle(modView, "backgroundColor", theme.main_color);
-      buttons.forEach(btn => {
-        applyStyle(btn, "backgroundColor", theme.secondary_color);
-        const span = btn.querySelector("span");
-        applyStyle(span, "color", theme.ui_text_color);
-      });
-      if (ratingBg) {
-        applyStyle(ratingBg, "backgroundColor", theme.secondary_color);
-        ratingBg.querySelectorAll(".modRating, .modPlayCount").forEach(el => {
-          applyStyle(el, "color", theme.ui_text_color);
-        });
-      }
-    } else {
-      if (modTitle) {
-        modTitle.style.background = "";
-        modTitle.style.backgroundColor = "";
-        modTitle.querySelector("p").style.color = "";
-      }
-      if (modDesc) {
-        modDesc.style.backgroundColor = "";
-        modDesc.style.color = "";
-      }
-      modView.style.backgroundColor = "";
-      buttons.forEach(btn => {
-        btn.style.backgroundColor = "";
-        const span = btn.querySelector("span");
-        if (span) span.style.color = "";
-      });
-      if (ratingBg) {
-        ratingBg.style.backgroundColor = "";
-        ratingBg.querySelectorAll(".modRating, .modPlayCount").forEach(el => {
-          el.style.color = "";
-        });
-      }
-    }
-  });
+    theme.ui_text_color ? modView.style.setProperty("--theme-ui-text", theme.ui_text_color) : modView.style.removeProperty("--theme-ui-text");
+  } else {
+    modView.style.removeProperty("--theme-header-bg");
+    modView.style.removeProperty("--theme-header-color");
+    modView.style.removeProperty("--theme-header-text");
+    modView.style.removeProperty("--theme-desc-bg");
+    modView.style.removeProperty("--theme-desc-text");
+    modView.style.removeProperty("--theme-main-color");
+    modView.style.removeProperty("--theme-secondary-color");
+    modView.style.removeProperty("--theme-secondary-hover");
+    modView.style.removeProperty("--theme-ui-text");
+  }
 }
 
-function extractFromCode1(includes, start, end, rawModText, nameOfMod) {
-  if (!rawModText) {
-    return null;
-  }
+function applyModBoxThemes() {
+  modList.forEach(modView => applySingleModTheme(modView, currentModThemeState));
+}
 
-  if (!rawModText.includes(includes)) {
-    return null;
-  }
+// finds the end index of a code block by balancing brackets/parentheses,
+// while ignoring characters inside strings or regex
+function findSnippetEnd(text, startIndex, openChar, closeChar) {
+  let count = 1;
+  let inString = false;
+  let inComment = false;
+  let stringChar = null; // ' or " or `
+  let isEscaped = false;
 
-  const possibleEndIndices = getAllIndexes(rawModText, end);
-  let codeSnippet = null;
-  let temp = {};
+  for (let i = startIndex; i < text.length; i++) {
+    const char = text[i];
 
-  for (let i = 0; i < possibleEndIndices.length; i++) {
-    codeSnippet = rawModText.slice(
-      rawModText.indexOf(start),
-      possibleEndIndices[i] + 1,
-    );
-
-    if (!codeSnippet || codeSnippet.length <= 0) {
+    // handle escaping (e.g. \" inside a string)
+    if (isEscaped) {
+      isEscaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      isEscaped = true;
       continue;
     }
 
-    try {
-      eval("temp" + codeSnippet);
-    } catch (e) {
-      // console.log("FAILED" + e)
-      codeSnippet = null;
+    // handle strings
+    if (inString) {
+      if (char === stringChar) {
+        inString = false; // closed the string
+      }
+      continue;
     }
 
-    if (codeSnippet) {
-      break;
+    // handle single line comments
+    if (inComment) {
+      if (char === '\n') inComment = false;
+      continue;
+    }
+    if (!inString && char === '/' && text[i + 1] === '/') {
+      inComment = true;
+      i++; // skip next slash
+      continue;
+    }
+
+    // enter string mode
+    if (char === '"' || char === "'" || char === "`") {
+      inString = true;
+      stringChar = char;
+      continue;
+    }
+
+    // handle brackets
+    if (char === openChar) {
+      count++;
+    } else if (char === closeChar) {
+      count--;
+      if (count === 0) {
+        return i; // found the matching closing bracket
+      }
     }
   }
 
-  if (!codeSnippet) {
-    console.log(`Could not extract ${includes} from ${nameOfMod}`);
+  return -1; // likely unclosed bracket
+}
+
+function findCodeSnippet(includes, start, end, rawModText, nameOfMod) {
+  if (!rawModText || !rawModText.includes(includes)) {
+    return null;
+  }
+
+  const startIndex = rawModText.indexOf(start);
+  if (startIndex === -1) return null;
+
+  const openChar = end === "}" ? "{" : (end === "]" ? "[" : "(");
+  const contentStartIndex = startIndex + start.length;
+  const endIndex = findSnippetEnd(rawModText, contentStartIndex, openChar, end);
+
+  if (endIndex === -1) {
+    console.log(`Could not find closing '${end}' for ${nameOfMod}`);
+    return null;
+  }
+
+  return rawModText.slice(startIndex, endIndex + 1);
+}
+
+function extractFromCode1(includes, start, end, rawModText, nameOfMod) {
+  if (!rawModText || !rawModText.includes(includes)) {
+    return null;
+  }
+
+  const startIndex = rawModText.indexOf(start);
+  if (startIndex === -1) return null;
+
+  // Determine the character mapping based on the 'end' param provided
+  const openChar = end === "}" ? "{" : (end === "]" ? "[" : "(");
+
+  const contentStartIndex = startIndex + start.length;
+  const endIndex = findSnippetEnd(rawModText, contentStartIndex, openChar, end);
+
+  if (endIndex === -1) {
+    console.log(`Could not find closing '${end}' for ${nameOfMod}`);
+    return null;
+  }
+
+  const codeSnippet = rawModText.slice(startIndex, endIndex + 1);
+
+  let temp = {};
+
+  try {
+    const runner = new Function("temp", "temp" + codeSnippet);
+    runner(temp);
+  } catch (e) {
+    console.warn(`Error parsing metadata for ${nameOfMod}:`, e);
+    return null;
   }
 
   return temp;
@@ -236,8 +638,9 @@ function mixColor(hex, mixWith, percent) {
   let b = Math.round(b1 * (1 - percent) + b2 * percent);
   return rgbToHex(r, g, b);
 }
+
 function getContrastRatio(hex1, hex2) {
-  // so we can calculate the contrast ratio between two hex colors (WCAG) 
+  // so we can calculate the contrast ratio between two hex colors (WCAG)
   function luminance([r, g, b]) {
     let a = [r, g, b].map(function (v) {
       v /= 255;
@@ -251,6 +654,39 @@ function getContrastRatio(hex1, hex2) {
   let darkest = Math.min(lum1, lum2);
   return (brightest + 0.05) / (darkest + 0.05);
 }
+
+function adjustThemeContrast(themeBaseColor, themeTextColor) {
+  let ratio = getContrastRatio(themeBaseColor, themeTextColor);
+  let tries = 0;
+
+  while (ratio < 4.5 && tries < 5) {
+    if (themeBaseColor === '#fff') {
+      themeBaseColor = mixColor(themeBaseColor, '#000', 0.2);
+    } else {
+      themeBaseColor = mixColor(themeBaseColor, '#fff', 0.2);
+    }
+    const contrastWhite2 = getContrastRatio(themeBaseColor, '#fff');
+    const contrastBlack2 = getContrastRatio(themeBaseColor, '#222');
+    themeTextColor = contrastWhite2 > contrastBlack2 ? '#fff' : '#222';
+    ratio = getContrastRatio(themeBaseColor, themeTextColor);
+    tries++;
+  }
+
+  return { themeBaseColor, themeTextColor };
+}
+
+function lightenDarkenContrast(themeBaseColor, themeTextColor) {
+  let lum = getContrastRatio(themeBaseColor, '#fff');
+  if (themeTextColor === '#222' && lum < 2.5) {
+    themeBaseColor = mixColor(themeBaseColor, '#fff', 0.3);
+    themeTextColor = getContrastYIQ(themeBaseColor);
+  } else if (themeTextColor === '#fff' && lum > 6) {
+    themeBaseColor = mixColor(themeBaseColor, '#000', 0.3);
+    themeTextColor = getContrastYIQ(themeBaseColor);
+  }
+  return { themeBaseColor, themeTextColor };
+}
+
 function ensureThemeContrast(theme) {
   if (theme._isFallback) {
     // adjust text color for header contrast
@@ -258,106 +694,86 @@ function ensureThemeContrast(theme) {
       const contrastWhite = getContrastRatio(theme.header_color, '#fff');
       const contrastBlack = getContrastRatio(theme.header_color, '#222');
       theme.header_text_color = contrastWhite > contrastBlack ? '#fff' : '#222';
-      let ratio = getContrastRatio(theme.header_color, theme.header_text_color);
-      let tries = 0;
-      while (ratio < 4.5 && tries < 5) {
-        if (theme.header_text_color === '#fff') {
-          theme.header_color = mixColor(theme.header_color, '#000', 0.2);
-        } else {
-          theme.header_color = mixColor(theme.header_color, '#fff', 0.2);
-        }
-        const contrastWhite2 = getContrastRatio(theme.header_color, '#fff');
-        const contrastBlack2 = getContrastRatio(theme.header_color, '#222');
-        theme.header_text_color = contrastWhite2 > contrastBlack2 ? '#fff' : '#222';
-        ratio = getContrastRatio(theme.header_color, theme.header_text_color);
-        tries++;
-      }
+
+      const { themeBaseColor, themeTextColor } = adjustThemeContrast(
+        theme.header_color, theme.header_text_color
+      );
+
+      theme.header_color = themeBaseColor;
+      theme.header_text_color = themeTextColor;
     }
     // adjust text color for description contrast
     if (theme.description_background_color) {
       const contrastWhite = getContrastRatio(theme.description_background_color, '#fff');
       const contrastBlack = getContrastRatio(theme.description_background_color, '#222');
       theme.description_text_color = contrastWhite > contrastBlack ? '#fff' : '#222';
-      let ratio = getContrastRatio(theme.description_background_color, theme.description_text_color);
-      let tries = 0;
-      while (ratio < 4.5 && tries < 5) {
-        if (theme.description_text_color === '#fff') {
-          theme.description_background_color = mixColor(theme.description_background_color, '#000', 0.2);
-        } else {
-          theme.description_background_color = mixColor(theme.description_background_color, '#fff', 0.2);
-        }
-        const contrastWhite2 = getContrastRatio(theme.description_background_color, '#fff');
-        const contrastBlack2 = getContrastRatio(theme.description_background_color, '#222');
-        theme.description_text_color = contrastWhite2 > contrastBlack2 ? '#fff' : '#222';
-        ratio = getContrastRatio(theme.description_background_color, theme.description_text_color);
-        tries++;
-      }
+
+      const { themeBaseColor, themeTextColor } = adjustThemeContrast(
+        theme.description_background_color, theme.description_text_color
+      );
+
       // for mod description backgrounds; we lighten/darken based on text color
-      let lum = getContrastRatio(theme.description_background_color, '#fff');
-      if (theme.description_text_color === '#222' && lum < 2.5) {
-        theme.description_background_color = mixColor(theme.description_background_color, '#fff', 0.3);
-        theme.description_text_color = getContrastYIQ(theme.description_background_color);
-      } else if (theme.description_text_color === '#fff' && lum > 6) {
-        theme.description_background_color = mixColor(theme.description_background_color, '#000', 0.3);
-        theme.description_text_color = getContrastYIQ(theme.description_background_color);
-      }
+      const finalContrast = lightenDarkenContrast(themeBaseColor, themeTextColor);
+      theme.description_background_color = finalContrast.themeBaseColor;
+      theme.description_text_color = finalContrast.themeTextColor;
     }
     // adjust text color for secondary contrast
     if (theme.secondary_color) {
       const contrastWhite = getContrastRatio(theme.secondary_color, '#fff');
       const contrastBlack = getContrastRatio(theme.secondary_color, '#222');
       theme.ui_text_color = contrastWhite > contrastBlack ? '#fff' : '#000';
-      let ratio = getContrastRatio(theme.secondary_color, theme.ui_text_color);
-      let tries = 0;
-      while (ratio < 4.5 && tries < 5) {
-        if (theme.ui_text_color === '#fff') {
-          theme.secondary_color = mixColor(theme.secondary_color, '#000', 0.2);
-        } else {
-          theme.secondary_color = mixColor(theme.secondary_color, '#fff', 0.2);
-        }
-        const contrastWhite2 = getContrastRatio(theme.secondary_color, '#fff');
-        const contrastBlack2 = getContrastRatio(theme.secondary_color, '#222');
-        theme.ui_text_color = contrastWhite2 > contrastBlack2 ? '#fff' : '#000';
-        ratio = getContrastRatio(theme.secondary_color, theme.ui_text_color);
-        tries++;
-      }
+
+      const { themeBaseColor, themeTextColor } = adjustThemeContrast(
+        theme.secondary_color, theme.ui_text_color
+      );
+
       // for secondary colors; we lighten/darken based on text color
-      let lum = getContrastRatio(theme.secondary_color, '#fff');
-      if (theme.ui_text_color === '#222' && lum < 2.5) {
-        theme.secondary_color = mixColor(theme.secondary_color, '#fff', 0.3);
-        theme.ui_text_color = getContrastYIQ(theme.secondary_color);
-      } else if (theme.ui_text_color === '#fff' && lum > 6) {
-        theme.secondary_color = mixColor(theme.secondary_color, '#000', 0.3);
-        theme.ui_text_color = getContrastYIQ(theme.secondary_color);
-      }
+      const finalContrast = lightenDarkenContrast(themeBaseColor, themeTextColor);
+      theme.secondary_color = finalContrast.themeBaseColor;
+      theme.ui_text_color = finalContrast.themeTextColor;
     }
   }
 }
 
 // regex patterns to extract theme details from raw mod text
-const winColorRegex = /coloring_window\s*=\s*['"](#[A-Fa-f0-9]{6,8})['"]/;
-const titleColorRegex = /coloring_title\s*=\s*['"](#[A-Fa-f0-9]{6,8})['"]/;
-const headerImgRegex = /game_header"\)\.style="background-image: url\(([^\)]+)\)/;
-const winImgRegex = /game_window"\)\.style.backgroundImage = "url\(([^\)]+)\)/;
-const borderColorRegex = /game_window"\)\.style.borderColor = "(#[A-Fa-f0-9]{6,8})"/;
+const fallbackThemeRegex = new RegExp(
+  [
+    String.raw`coloring_window\s*=\s*['"](?<winColor>#[A-Fa-f0-9]{6,8})['"]`,
+    String.raw`coloring_title\s*=\s*['"](?<titleColor>#[A-Fa-f0-9]{6,8})['"]`,
+    String.raw`game_header"\)\.style="background-image: url\((?<headerImg>[^\)]+)\)`,
+    String.raw`game_window"\)\.style.backgroundImage = "url\((?<winImg>[^\)]+)\)`,
+    String.raw`game_window"\)\.style.borderColor = "(?<borderColor>#[A-Fa-f0-9]{6,8})"`,
+    String.raw`text_col\s*=\s*["'](?<textCol>#[A-Fa-f0-9]{6,8}|white|black)["']`,
+  ].join('|'),
+  'g'
+);
 
 function extractFallbackTheme(rawModText, nameOfMod) {
   // only create a theme if a real modBoxTheme doesn't exist
   if (customModBoxThemes[nameOfMod] && customModBoxThemes[nameOfMod].header_color) return;
 
+  // skip the regex scan entirely if none of the markers exist
+  if (!rawModText.includes('coloring_') &&
+    !rawModText.includes('game_header') &&
+    !rawModText.includes('game_window') &&
+    !rawModText.includes('text_col')) {
+    return;
+  }
+
   const theme = { _isFallback: true };
+  let winColor = null, titleColor = null, borderColor = null;
 
-  const winColorMatch = rawModText.match(winColorRegex);
-  const titleColorMatch = rawModText.match(titleColorRegex);
-  const headerImgMatch = rawModText.match(headerImgRegex);
-  const winImgMatch = rawModText.match(winImgRegex);
-  const borderColorMatch = rawModText.match(borderColorRegex);
-
-  const textColMatch = rawModText.match(/text_col\s*=\s*["'](#[A-Fa-f0-9]{6,8}|white|black)["']/);
-
-  let winColor = winColorMatch ? winColorMatch[1] : null;
-  let titleColor = titleColorMatch ? titleColorMatch[1] : null;
-  let borderColor = borderColorMatch ? borderColorMatch[1] : null;
+  for (const match of rawModText.matchAll(fallbackThemeRegex)) {
+    const g = match.groups;
+    if (g.winColor && !winColor) winColor = g.winColor;
+    if (g.titleColor && !titleColor) titleColor = g.titleColor;
+    if (g.headerImg && !theme.header_image_url) theme.header_image_url = g.headerImg;
+    if (g.winImg && !theme.description_background_color) theme.description_background_color = g.winImg;
+    if (g.borderColor && !borderColor) borderColor = g.borderColor;
+    if (g.textCol && !theme.header_text_color) {
+      theme.header_text_color = g.textCol === 'white' ? '#fff' : (g.textCol === 'black' ? '#222' : g.textCol);
+    }
+  }
 
   // if winColor and titleColor are the same, generate a lighter/darker variant
   if (winColor && titleColor && winColor === titleColor) {
@@ -369,9 +785,6 @@ function extractFallbackTheme(rawModText, nameOfMod) {
     theme.header_color = titleColor;
     theme.secondary_color = borderColor || titleColor || winColor;
   }
-
-  if (headerImgMatch) theme.header_image_url = headerImgMatch[1];
-  if (winImgMatch) theme.description_background_color = winImgMatch[1];
 
   // no background color for the description? use main_color, header_color, or white
   if (!theme.description_background_color) {
@@ -394,12 +807,7 @@ function extractFallbackTheme(rawModText, nameOfMod) {
     theme.description_background_color = mixColor(theme.main_color, '#000', 0.25);
   }
 
-  // if header_text_color is not set, use text_col if found
-  if (textColMatch) {
-    theme.header_text_color = textColMatch[1] === 'white' ? '#fff' : (textColMatch[1] === 'black' ? '#222' : textColMatch[1]);
-  }
-
-  // ensure contrast for the theme colors 
+  // ensure contrast for the theme colors
   ensureThemeContrast(theme);
 
   // if at least one color was found, save it as a theme
@@ -408,80 +816,91 @@ function extractFallbackTheme(rawModText, nameOfMod) {
   }
 }
 
-function getCustomTheme(rawModText, nameOfMod) {
-  const temp = extractFromCode1(
-    "campaignTrail_temp.modBoxTheme = {",
-    ".modBoxTheme = {",
-    "}",
-    rawModText,
-    nameOfMod,
+function extractModMetadata(rawModText, nameOfMod) {
+  const snippets = [];
+  if (window.loadedMetadataMods) {
+    window.loadedMetadataMods.add(nameOfMod);
+  }
+
+  // find achievements
+  const achSnippet = findCodeSnippet(
+    "campaignTrail_temp.achievements = {",
+    ".achievements = {", "}",
+    rawModText, nameOfMod
   );
-  if (temp?.modBoxTheme && Object.keys(temp.modBoxTheme).length > 0) {
-    customModBoxThemes[nameOfMod] = temp.modBoxTheme;
-  } else {
+  if (achSnippet) snippets.push("temp" + achSnippet);
+
+  // find mod themes
+  const themeSnippet = findCodeSnippet(
+    "campaignTrail_temp.modBoxTheme = {",
+    ".modBoxTheme = {", "}",
+    rawModText, nameOfMod
+  );
+  if (themeSnippet) snippets.push("temp" + themeSnippet);
+
+  if (snippets.length > 0) {
+    const temp = {};
+    try {
+      const runner = new Function("temp", snippets.join(";\n"));
+      runner(temp);
+    } catch (e) {
+      console.warn(`Error parsing metadata for ${nameOfMod}:`, e);
+    }
+
+    if (temp.achievements) {
+      allAch[nameOfMod] = temp.achievements;
+    }
+    if (temp.modBoxTheme && Object.keys(temp.modBoxTheme).length > 0) {
+      customModBoxThemes[nameOfMod] = temp.modBoxTheme;
+    }
+  }
+
+  // if no theme found, try regex extraction
+  if (!customModBoxThemes[nameOfMod]) {
     extractFallbackTheme(rawModText, nameOfMod);
   }
 }
 
-function getAllAchievements(rawModText, nameOfMod) {
-  const temp = extractFromCode1(
-    "campaignTrail_temp.achievements = {",
-    ".achievements = {",
-    "}",
-    rawModText,
-    nameOfMod,
-  );
-
-  if (temp?.achievements) {
-    allAch[nameOfMod] = temp.achievements;
-  }
-}
-
 function extractElectionDetails(rawModText, nameOfMod) {
-  if (!rawModText) {
-    return null;
-  }
+  if (!rawModText) return null;
 
-  let start, end;
+  // determine which format the mod uses
+  let start = "";
+  let openChar = "";
+  let closeChar = "";
 
   if (rawModText.includes(".election_json = JSON.parse(")) {
     start = ".election_json = JSON.parse(";
-    end = ")";
+    openChar = "(";
+    closeChar = ")";
   } else if (rawModText.includes(".election_json = [")) {
     start = ".election_json = [";
-    end = "]";
+    openChar = "[";
+    closeChar = "]";
   } else {
-    console.log(`Could not extract metadata for mod: ${nameOfMod}`);
+    // console.log(`Could not find election_json start for: ${nameOfMod}`);
     return null;
   }
 
-  const possibleEndIndices = getAllIndexes(rawModText, end);
-  let codeSnippet = null;
-  let temp = {};
+  const startIndex = rawModText.indexOf(start);
+  const contentStartIndex = startIndex + start.length;
 
-  for (let i = 0; i < possibleEndIndices.length; i++) {
-    codeSnippet = rawModText.slice(
-      rawModText.indexOf(start),
-      possibleEndIndices[i] + 1,
-    );
+  const endIndex = findSnippetEnd(rawModText, contentStartIndex, openChar, closeChar);
 
-    if (!codeSnippet || codeSnippet.length <= 0) {
-      continue;
-    }
-
-    try {
-      eval("temp" + codeSnippet);
-    } catch {
-      codeSnippet = null;
-    }
-
-    if (codeSnippet) {
-      break;
-    }
+  if (endIndex === -1) {
+    console.log(`Could not extract election details (unclosed) for ${nameOfMod}`);
+    return null;
   }
 
-  if (!codeSnippet || Object.keys(temp).length === 0) {
-    console.log(`Could not extract from ${nameOfMod}`);
+  const codeSnippet = rawModText.slice(startIndex, endIndex + 1);
+  let temp = {};
+
+  try {
+    const runner = new Function("temp", "temp" + codeSnippet);
+    runner(temp);
+  } catch (e) {
+    console.warn(`Error parsing election details for ${nameOfMod}:`, e);
+    return null;
   }
 
   return temp;
@@ -495,9 +914,13 @@ const failedIconUrls = {};
 // when testing CTS in forks, the award icons may not be available
 // so we provide an alternative URL to load them from
 function getAlternativeIconUrl(url) {
-  if (url.includes('/static/dba2024/')) {
-    const fileName = url.split('/').pop();
-    return `https://raw.githubusercontent.com/campaign-trail-showcase/campaign-trail-showcase.github.io/refs/heads/main/static/dba2024/${fileName}`;
+  if (url.includes('/static/dba')) {
+    const parts = url.split('/');
+    const dbaFolder = parts.find(p => p.startsWith('dba'));
+    const fileName = parts.pop();
+    if (dbaFolder && fileName) {
+      return `https://raw.githubusercontent.com/campaign-trail-showcase/campaign-trail-showcase.github.io/refs/heads/main/static/${dbaFolder}/${fileName}`;
+    }
   }
   return null;
 }
@@ -561,6 +984,18 @@ function preloadAwardIcon(url) {
   return loadPromise;
 }
 
+// preloads icons in small batches
+async function preloadInBatches(urls, batchSize = 6) {
+  const arr = [...urls];
+  let loaded = 0;
+  for (let i = 0; i < arr.length; i += batchSize) {
+    const batch = arr.slice(i, i + batchSize);
+    const results = await Promise.allSettled(batch.map(preloadAwardIcon));
+    loaded += results.filter(r => r.status === 'fulfilled').length;
+  }
+  return loaded;
+}
+
 function createLegacyViewControls() {
   const container = document.createElement("div");
   container.style.display = "inline-flex";
@@ -578,7 +1013,7 @@ function createLegacyViewControls() {
     showAllModsLegacy = checkbox.checked;
     try {
       localStorage.setItem("showAllModsLegacy", showAllModsLegacy);
-    } catch (e) {}
+    } catch (e) { }
     currentPage = 1;
     updateModViews();
   });
@@ -586,6 +1021,7 @@ function createLegacyViewControls() {
   const label = document.createElement("label");
   label.htmlFor = "modMenuLegacyViewCheckbox";
   label.innerText = "View all mods";
+  label.className = "mod-legacy-view-label";
   label.style.cursor = "pointer";
   label.style.userSelect = "none";
 
@@ -603,19 +1039,53 @@ function createLegacyViewControls() {
 
 
 $(document).ready(async () => {
+  await initDB();
+
+  // wait for base JSONs to load first
+  if (window.baseJSONPromises && window.baseJSONPromises.length > 0) {
+    await Promise.all(window.baseJSONPromises);
+  }
+
+  // migrate localStorage mods to IndexedDB
+  await migrateLocalStorageToIndexedDB();
+
   // show loading indicator while mods load
   const gridEl = document.getElementById("mod-grid");
-  if (gridEl) gridEl.innerHTML = `<div id="loading-mods-text" style="text-align:center;margin:20px;">Loading mods...</div>`;
+  if (gridEl) {
+    gridEl.replaceChildren();
+    const loader = document.createElement("div");
+    loader.id = "loading-mods-text";
+    loader.style.textAlign = "center";
+    loader.style.margin = "20px";
+    loader.textContent = "Loading mods...";
+    gridEl.appendChild(loader);
+  }
 
   const modNameParam = getUrlParam("modName");
+  const localModParam = getUrlParam("localMod");
 
   favoriteMods = new Set(
     localStorage.getItem("favoriteMods")?.split(",") || [],
   );
-  customMods = new Set(localStorage.getItem("customMods")?.split(",") || []);
 
-  const $modSelect = $("#modSelect");
-  const originalOptions = $modSelect.find("option").clone();
+  // Load custom mods list from IndexedDB
+  const customModNames = await getAllCustomModNames();
+  customMods = new Set(customModNames);
+
+  // if loading a specific mod, skip building the gallery
+  if (localModParam || modNameParam) {
+    const targetMod = localModParam || modNameParam;
+
+    if (localModParam && !customMods.has(localModParam)) {
+      alert(`Zoinks! The local mod "${localModParam}" could not be found in your saved mods.`);
+    } else {
+      const gridEl = document.getElementById("mod-grid");
+      if (gridEl) gridEl.style.display = "none";
+
+      loadModFromButton(targetMod);
+      return;
+    }
+  }
 
   // Inject the "View all mods" checkbox next to the sorter using a more robust selector
   const sorter = document.querySelector('[onchange="onChangeModSorter(event)"]');
@@ -627,7 +1097,9 @@ $(document).ready(async () => {
     console.warn("Could not find mod sorter dropdown to attach 'View all' checkbox.");
   }
 
-  $(".tagCheckbox").on("change", filterEntries);
+  document.querySelectorAll(".tagCheckbox").forEach(checkbox => {
+    checkbox.addEventListener("change", filterEntries);
+  });
 
   await loadEntries();
   const mods = document.getElementById("modSelect").childNodes;
@@ -649,64 +1121,66 @@ $(document).ready(async () => {
     }
   });
 
-  let allModsLength = mods.length - 1;
-  let modsLoaded = [];
+  // populate custom mod shells first, so they always occupy the beginning of the list
+  customModNames.forEach((customModName) => {
+    const modView = createModView({
+      value: customModName,
+      innerText: customModName,
+      dataset: { tags: "Custom" }
+    });
+    modList.push(modView);
+    modMap.set(customModName, modView);
+  });
 
-  // Set up from normal mods
-  const modPromises = Array.from(mods).map(async (mod) => {
-    // MODIFICADO: lógica para carregar ambos os mods quando necessário
+  // gather standard mods based on query parameters
+  const targetMod = getUrlParam("modName");
+  const standardModsToLoad = [];
+
+  Array.from(mods).forEach((mod) => {
+    const isLinked = targetMod && typeof expandFavoriteSet === 'function' && expandFavoriteSet(new Set([targetMod])).has(mod.value);
+    const isDSAClassicLink = targetMod === "2024" && mod.value === "2024 Divided States" || targetMod === "2024 Divided States" && mod.value === "2024";
+
     if (
       mod.value === "other" ||
-      ( // Special case for DSA because it uses two code 1s to define achievements. So we need to load both of those to get both sets.
-        getUrlParam("modName") != null &&
-        getUrlParam("modName") != mod.value &&
-        !(getUrlParam("modName") === "2024" && mod.value === "2024 Divided States")
+      (
+        targetMod != null &&
+        targetMod != mod.value &&
+        !isLinked && !isDSAClassicLink
       )
     ) {
-      allModsLength--;
       return;
     }
 
     namesOfModsFromValue[mod.value] = mod.innerText ?? mod.value;
-
-    try {
-      const modRes = await fetch(`../static/mods/${mod.value}_init.html`);
-      const rawModText = await modRes.text();
-
-      const temp = extractElectionDetails(rawModText, mod.value);
-      getAllAchievements(rawModText, mod.value);
-      getCustomTheme(rawModText, mod.value);
-
-      let imageUrl = "";
-      let description = "";
-      let loaded = true;
-
-      if (temp?.election_json?.length > 0 && temp.election_json[0].fields) {
-        imageUrl = temp.election_json[0].fields.site_image ?? temp.election_json[0].fields.image_url;
-        description = temp.election_json[0].fields.site_description ?? temp.election_json[0].fields.summary;
-      } else {
-        loaded = false;
-        console.log(`Missing or cannot read Code 1 for mod: ${mod.value}`);
-        description = `<h1 style="color:red">COULD NOT GET CODE 1 PLEASE ALERT DEV!</h1>`;
-      }
-
-      if (!loaded) {
-        allModsLength--;
-        return;
-      }
-
-      modsLoaded.push({ mod: mod, imageUrl: imageUrl, description: description });
-    } catch (error) {
-      console.error(`Error loading mod ${mod.value}:`, error);
-      allModsLength--;
-    }
+    standardModsToLoad.push(mod);
   });
 
-  await Promise.all(modPromises);
+  // sort standard mods alphabetically by value
+  standardModsToLoad.sort((a, b) => {
+    if (a.value < b.value) return -1;
+    if (a.value > b.value) return 1;
+    return 0;
+  });
+
+  // populate standard card shells right after custom ones
+  standardModsToLoad.forEach((mod) => {
+    if (mod.value === '2024 Divided States') return; // skip special case
+
+    const modView = createModView(mod);
+
+    if (
+      mod.dataset.awardimageurls &&
+      mod.dataset.awardimageurls.split(", ").length > 1
+    ) {
+      cycleAwards(modView.querySelector(".trophy-holder"), 0);
+    }
+
+    modList.push(modView);
+    modMap.set(modView.id, modView);
+  });
 
   // if we are not loading a specific mod, preload all award icons
   if (!modNameParam) {
-    // collect all award icon URLs for preloading
     const allAwardIconUrls = new Set();
     Array.from(mods).forEach(mod => {
       if (mod.dataset && mod.dataset.awardimageurls) {
@@ -716,153 +1190,112 @@ $(document).ready(async () => {
       }
     });
 
-    // preload all award icons
     if (allAwardIconUrls.size > 0) {
-      console.log(`Preloading ${allAwardIconUrls.size} award icons...`);
-      Promise.allSettled([...allAwardIconUrls].map(preloadAwardIcon))
-        .then(results => {
-          const loaded = results.filter(r => r.status === 'fulfilled').length;
-          console.log(`Preloaded ${loaded}/${allAwardIconUrls.size} award icons`);
-        });
+      preloadInBatches(allAwardIconUrls, 6);
     }
   }
 
-  // Set up from custom mods
-  let customModsLoaded = [];
-  for (const customModName of customMods) {
-    const rawModText = localStorage.getItem(customModName + "_code1");
-
-    const temp = extractElectionDetails(rawModText, customModName);
-
-    if (
-      !temp?.election_json?.[0]?.fields
-    ) {
-      continue;
-    }
-
-    getAllAchievements(rawModText, customModName);
-    getCustomTheme(rawModText, customModName);
-
-    const imageUrl =
-      temp.election_json[0].fields.site_image ??
-      temp.election_json[0].fields.image_url;
-    const description =
-      temp.election_json[0].fields.site_description ??
-      temp.election_json[0].fields.summary;
-
-    const modView = createModView(
-      {
-        value: customModName,
-        innerText: customModName,
-        dataset: { tags: "Custom" },
-      },
-      imageUrl,
-      description,
-    );
-    customModsLoaded.push(modView);
-    modList.push(modView);
-  }
-
-  // push custom mods to the mod grid first
-  const modGrid = document.getElementById("mod-grid");
-  const fragment = document.createDocumentFragment();
-  customModsLoaded.forEach(modView => {
-    fragment.appendChild(modView);
-  });
-
-  modsLoaded.sort(modCompare);
-  for (let i = 0; i < modsLoaded.length; i++) {
-    const modData = modsLoaded[i];
-
-    // this is a special case for DSA, so we skip this in particular
-    if (modData.mod.value === '2024 Divided States') continue;
-
-    const modView = createModView(
-      modData.mod,
-      modData.imageUrl,
-      modData.description,
-    );
-    fragment.appendChild(modView);
-
-    if (
-      modData.mod.dataset.awardimageurls &&
-      modData.mod.dataset.awardimageurls.split(", ").length > 1
-    ) {
-      // find the holder and start the cycling process
-      cycleAwards(
-        modView.querySelector(".trophy-holder"),
-        0,
-      );
-    }
-
-    modList.push(modView);
-  }
-  modGrid.appendChild(fragment);
-
+  // initialize tags and render views
   createTagButtons(tagsFound);
   updateModViews();
-
   applyModBoxThemes();
-
-  if (modNameParam) {
-    customThemesButton.style.display = "none";
-    loadModFromButton(modNameParam);
-  }
 });
 
-function createModView(mod, imageUrl, description, isCustom) {
-  const modView = document.createElement("div");
-  modView.classList.add("community-grid-element");
+function createModView(mod, imageUrl = "", description = "Loading summary...") {
+  const modView = modViewTemplate.content.firstElementChild.cloneNode(true);
 
-  modView.setAttribute("mode", mod.dataset.mode);
-  modView.setAttribute("tags", mod.dataset.tags);
-  modView.setAttribute("awardimageurls", mod.dataset.awardimageurls);
-  modView.setAttribute("awards", mod.dataset.awards);
+  // set data attributes
+  modView.setAttribute("mode", mod.dataset?.mode || "");
+  modView.setAttribute("tags", mod.dataset?.tags || "");
+  modView.setAttribute("awardimageurls", mod.dataset?.awardimageurls || "");
+  modView.setAttribute("awards", mod.dataset?.awards || "");
   modView.setAttribute("mod-name", mod.value);
-  modView.setAttribute("mod-display-name", mod.innerText.toLowerCase());
-  namesOfModsFromValue[mod.value] = mod.innerText;
-
-  modView._tagsArray = mod.dataset.tags ? mod.dataset.tags.split(" ") : [];
-
-  const favText = isFavorite(mod.value) ? UNFAV : FAV;
-
-  modView.innerHTML = `
-    <div class="mod-title">
-        <p>${mod.innerText}</p>
-    </div>
-    <div class = "mod-img-desc">
-      <img class="mod-image" data-src="${imageUrl}" loading="lazy"></img>
-      <div class="mod-desc">${description}</div>
-    </div>
-    <div class="hover-button-holder">
-        <button class="mod-play-button hover-button" onclick="loadModFromButton(\`${mod.value}\`)"><span>${PLAY}</span></button>
-        <button class="hover-button" onclick="toggleFavorite(event, \`${mod.value}\`)"><span>${favText}</span></button>
-        <button style="${customMods.has(mod.value) ? "" : "display:none;"}" class="hover-button" onclick="deleteCustomMod(event, \`${mod.value}\`)"><span>${DELETE}</span></button>
-    </div>
-    ${!customMods.has(mod.value)
-      ? `
-    <div class="rating-background">
-        <div class="modRating">LOADING FAVORITES...</div>
-        <div class="modPlayCount">LOADING PLAYS...</div>
-        ${mod.dataset.awards != null && mod.dataset.awards.length > 0 ? renderAwards(mod.dataset.awards, mod.dataset.awardimageurls) : ""}
-    </div>`
-      : ""
-    }
-  `;
-
+  modView.setAttribute("mod-display-name", String(mod.innerText || mod.value || "").toLowerCase());
   modView.id = mod.value;
+
+  namesOfModsFromValue[mod.value] = mod.innerText ?? mod.value;
+  modView._tagsArray = mod.dataset?.tags ? mod.dataset.tags.split(" ") : [];
+
+  modView._elements = {
+    title: modView.querySelector(".mod-title"),
+    titleText: modView.querySelector(".mod-title p"),
+    desc: modView.querySelector(".mod-desc"),
+    image: modView.querySelector(".mod-image"),
+    playBtn: modView.querySelector(".mod-play-button"),
+    favBtn: modView.querySelector(".fav-button"),
+    deleteBtn: modView.querySelector(".delete-button"),
+    ratingBg: modView.querySelector(".rating-background"),
+    buttons: modView.querySelectorAll(".hover-button")
+  };
+
+  // set text and attributes
+  modView._elements.titleText.textContent = mod.innerText;
+  modView._elements.image.alt = mod.value + " Box Image";
+  modView._elements.desc.innerHTML = description;
+
+  if (imageUrl) {
+    modView._elements.image.src = imageUrl;
+  }
+
+  // Play button
+  modView._elements.playBtn.querySelector("span").innerHTML = PLAY;
+  modView._elements.playBtn.addEventListener("click", () => loadModFromButton(mod.value));
+
+  // determine if this is a custom/local mod
+  const isCustom = customMods.has(mod.value) || (mod.dataset && mod.dataset.tags && mod.dataset.tags.split(" ").includes("Custom"));
+
+  // Favorite button
+  if (isCustom) {
+    modView._elements.favBtn.style.display = "none";
+  } else {
+    modView._elements.favBtn.style.display = "";
+    modView._elements.favBtn.querySelector("span").innerHTML = isFavorite(mod.value) ? UNFAV : FAV;
+    modView._elements.favBtn.addEventListener("click", (e) => toggleFavorite(e, mod.value));
+  }
+
+  // Delete button
+  if (isCustom) {
+    modView._elements.deleteBtn.querySelector("span").innerHTML = DELETE;
+    modView._elements.deleteBtn.style.display = "";
+    modView._elements.deleteBtn.addEventListener("click", (e) => deleteCustomMod(e, mod.value));
+  } else {
+    modView._elements.deleteBtn.style.display = "none";
+  }
+
+  // handle rating display
+  if (isCustom) {
+    if (modView._elements.ratingBg) modView._elements.ratingBg.remove();
+  } else if (mod.dataset?.awards && mod.dataset.awards.length > 0) {
+    modView._elements.ratingBg.insertAdjacentHTML(
+      "beforeend",
+      renderAwards(mod.dataset.awards, mod.dataset.awardimageurls)
+    );
+  }
+
   return modView;
 }
 
 function renderAwards(awards, rawAwardUrls) {
   let awardUrls = rawAwardUrls.split(", ");
+  const awardNames = awards.split(",").map(award => award.trim());
 
-  // create an image tag for each URL. the first is visible, the rest are hidden
   let awardImagesHTML = awardUrls.map((url, index) => {
-    // if the primary URL fails, load the alternative URL
     const altUrl = getAlternativeIconUrl(url);
-    const style = index === 0 ? 'opacity: 1; transition: opacity 0.3s ease-in-out;' : 'opacity: 0; transition: opacity 0.3s ease-in-out;';
-    return `<img class="mod-trophy" src="${url}" style="${style}"${altUrl ? ` onerror="this.onerror=null;this.src='${altUrl}'"` : ""}>`;
+    const isFirst = index === 0;
+    const style = isFirst
+      ? 'opacity: 1; transition: opacity 0.3s ease-in-out;'
+      : 'opacity: 0; transition: opacity 0.3s ease-in-out;';
+
+    const srcAttr = isFirst ? `src="${url}"` : `data-src="${url}"`;
+
+    // store the alt URL
+    const altAttr = altUrl ? ` data-alt-url="${altUrl}"` : '';
+
+    const onerrorAttr = isFirst && altUrl
+      ? ` onerror="this.onerror=null;this.src='${altUrl}'"`
+      : '';
+
+    return `<img class="mod-trophy" ${srcAttr} alt="${awardNames[index]} Trophy" style="${style}"${altAttr}${onerrorAttr}>`;
   }).join('');
 
   return `
@@ -875,22 +1308,75 @@ function renderAwards(awards, rawAwardUrls) {
 
 function cycleAwards(holder, index) {
   // ensure the element is still part of the page
-  if (!holder || !holder.isConnected) {
+  if (!holder) {
+    return;
+  }
+
+  // clear any existing timeout to prevent multiple loops
+  if (holder._awardCycleTimeout) {
+    clearTimeout(holder._awardCycleTimeout);
+    holder._awardCycleTimeout = null;
+  }
+
+  // if not connected, we stop cycling - unless it's in a document fragment
+  if (!holder.isConnected && holder.getRootNode().nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+    holder.dataset.cycleIndex = index;
+    holder.dataset.isCycling = "false";
     return;
   }
 
   const images = holder.querySelectorAll(".mod-trophy");
-  if (images.length <= 1) {
-    return; // no need to cycle if there's only one image
-  }
+  if (images.length <= 1) return;
+
+  holder.dataset.isCycling = "true";
+  holder.dataset.cycleIndex = index;
 
   images[index].style.opacity = '0';
-  const nextIndex = (index + 1) % images.length;
-  images[nextIndex].style.opacity = '1';
 
-  setTimeout(() => {
+  const nextIndex = (index + 1) % images.length;
+  const nextImg = images[nextIndex];
+
+  ensureTrophySrc(nextImg);
+  nextImg.style.opacity = '1';
+
+  // pre-load the image AFTER next so it's cached by the time we need it
+  const preloadIndex = (nextIndex + 1) % images.length;
+  ensureTrophySrc(images[preloadIndex]);
+
+  holder._awardCycleTimeout = setTimeout(() => {
     cycleAwards(holder, nextIndex);
   }, 2000);
+}
+
+// stops all active award cycling timers in the grid
+function stopAllAwardCycles(container) {
+  const holders = container.querySelectorAll('.trophy-holder');
+  for (let i = 0; i < holders.length; i++) {
+    const holder = holders[i];
+    if (holder._awardCycleTimeout) {
+      clearTimeout(holder._awardCycleTimeout);
+      holder._awardCycleTimeout = null;
+    }
+    holder.dataset.isCycling = "false";
+  }
+}
+
+function ensureTrophySrc(img) {
+  if (!img || img.hasAttribute('src')) return; // already loaded or loading
+
+  const url = img.dataset.src;
+  if (!url) return;
+
+  // wire up fallback before setting src so the handler is ready if it fails
+  const altUrl = img.dataset.altUrl;
+  if (altUrl) {
+    img.onerror = function () {
+      this.onerror = null;
+      this.src = altUrl;
+    };
+  }
+
+  img.src = url;
 }
 
 function configureRatingButtons(modName, modView) {
@@ -975,29 +1461,29 @@ function addCustomModButton() {
 
 function deleteCustomMod(event, modValue) {
   customMods.delete(modValue);
-  localStorage.removeItem(modValue + "_code1");
-  localStorage.removeItem(modValue + "_code2");
-
-  if (customMods.size === 0) {
-    localStorage.removeItem("customMods");
-  } else {
-    localStorage.setItem("customMods", Array.from(customMods));
-  }
+  deleteModFromDB(modValue);
+  saveCustomModNames(customMods);
 
   // remove from the grid
-  const modView = document.getElementById(modValue);
+  const modView = modMap.get(modValue);
   if (modView) {
-    modView.parentNode.removeChild(modView);
-  }
-  const idx = modList.findIndex(mv => mv.id === modValue);
-  if (idx !== -1) {
-    modList.splice(idx, 1);
+    if (modView.parentNode) modView.parentNode.removeChild(modView);
+    const idx = modList.indexOf(modView);
+    if (idx !== -1) modList.splice(idx, 1);
+    modMap.delete(modValue);
   }
 
   updateModViews();
 }
 
-function addCustomMod(code1, code2) {
+async function addCustomMod(code1, code2) {
+  if (!code1) {
+    alert("Code 1 is required!");
+    return;
+  }
+
+  // ensure code2 is a string to prevent DB errors
+  const safeCode2 = code2 || "";
   const temp = extractElectionDetails(code1, "custom mod being added");
 
   if (!temp) {
@@ -1005,66 +1491,91 @@ function addCustomMod(code1, code2) {
     return;
   }
 
-  const modName =
-    document.getElementById("customModName").value ??
-    temp.election_json[0].fields.year;
+  const modName = String(document.getElementById("customModName").value || temp.election_json[0].fields.year);
 
   // save/update custom mod
   customMods.add(modName);
-  localStorage.setItem("customMods", Array.from(customMods));
-  localStorage.setItem(modName + "_code1", code1);
-  localStorage.setItem(modName + "_code2", code2);
+
+  // save to storage
+  try {
+    await saveCustomModNames(customMods);
+    await saveModToDB(modName, code1, safeCode2);
+  } catch (e) {
+    console.error("Failed to save mod to DB:", e);
+    alert("There was an error saving the mod to the database. We will try to load it anyway.");
+  }
 
   // remove old mod if it exists
-  const oldModView = document.getElementById(modName);
-  if (oldModView && oldModView.parentNode) {
-    oldModView.parentNode.removeChild(oldModView);
-  }
-  const oldIdx = modList.findIndex(mv => mv.id === modName);
-  if (oldIdx !== -1) {
-    modList.splice(oldIdx, 1);
+  const oldModView = modMap.get(modName);
+  if (oldModView) {
+    if (oldModView.parentNode) oldModView.parentNode.removeChild(oldModView);
+    const oldIdx = modList.indexOf(oldModView);
+    if (oldIdx !== -1) modList.splice(oldIdx, 1);
+    modMap.delete(modName);
   }
 
   // update mod box theme
-  getAllAchievements(code1, modName);
-  getCustomTheme(code1, modName);
+  extractModMetadata(code1, modName);
 
-  const imageUrl =
-    temp.election_json[0].fields.site_image ??
-    temp.election_json[0].fields.image_url;
-  const description =
-    temp.election_json[0].fields.site_description ??
-    temp.election_json[0].fields.summary;
+  const imageUrl = temp.election_json[0].fields.site_image ?? temp.election_json[0].fields.image_url;
+  const description = temp.election_json[0].fields.site_description ?? temp.election_json[0].fields.summary;
 
   const modView = createModView(
-    {
-      value: modName,
-      innerText: modName,
-      dataset: { tags: "Custom" },
-    },
+    { value: modName, innerText: modName, dataset: { tags: "Custom" } },
     imageUrl,
     description,
   );
 
-  const modGrid = document.getElementById("mod-grid");
-  modGrid.insertBefore(modView, modGrid.firstChild);
   modList.unshift(modView);
+  modMap.set(modName, modView);
 
   // ensure "Custom" tag is checked so the new mod is visible
+  let customTagFound = false;
   for (const tagCheckbox of tagList) {
     if (tagCheckbox.value === "Custom") {
       tagCheckbox.checked = true;
+      customTagFound = true;
     }
   }
+
+  // if the "Custom" tag button doesn't exist yet, create it
+  if (!customTagFound) {
+    const tagsGrid = document.getElementById("tags");
+    const tagButton = document.createElement("div");
+    tagButton.classList.add("tag-button");
+
+    tagButton.innerHTML = `
+      <input type="checkbox" id="Custom" name="Custom" value="Custom" checked>
+      <label style="user-select:none" for="Custom">Custom</label><br>
+    `;
+
+    const checkbox = tagButton.getElementsByTagName("INPUT")[0];
+
+    tagButton.addEventListener("click", (event) => {
+      if (event.target === tagButton) checkbox.click();
+    });
+
+    checkbox.addEventListener("change", updateModViews);
+    tagList.push(checkbox);
+    tagsGrid.appendChild(tagButton);
+  }
+
+  // cached code 2
+  window.campaignTrail_temp = window.campaignTrail_temp || {};
+  window.campaignTrail_temp.custom_code_2 = safeCode2;
 
   updateModViews();
   applyModBoxThemes();
 }
 
+let debounceFilterTimer;
 function filterMods(event) {
   nameFilter = event.target.value.toLowerCase();
-  currentPage = 1;
-  updateModViews();
+  clearTimeout(debounceFilterTimer);
+  debounceFilterTimer = setTimeout(() => {
+    currentPage = 1;
+    updateModViews();
+  }, 150);
 }
 
 function createTagButtons(tagsFound) {
@@ -1135,14 +1646,15 @@ function updateModViews(event) {
 
   const modGrid = document.getElementById("mod-grid");
 
-  // clear the grid to start fresh
-  while (modGrid.firstChild) {
-    modGrid.removeChild(modGrid.firstChild);
-  }
+  // stop all cycling timers before removing elements
+  stopAllAwardCycles(modGrid);
 
-  // remove pagination controls as they will be re-added if needed
+  // clear the grid to start fresh
+  modGrid.replaceChildren();
+
+  // remove pagination controls
   const paginationContainer = document.getElementById("pagination-controls");
-  if (paginationContainer) paginationContainer.innerHTML = "";
+  if (paginationContainer) paginationContainer.replaceChildren();
 
   if (showAllModsLegacy) {
     toggleFilterControls(true);
@@ -1152,20 +1664,27 @@ function updateModViews(event) {
     if (loadingMessage) loadingMessage.style.display = 'inline';
     if (checkbox) checkbox.disabled = true;
 
-    setTimeout(() => {
+    requestAnimationFrame(() => {
       const fragment = document.createDocumentFragment();
       modList.forEach((modView) => {
         modView.style.display = "flex";
-        const img = modView.querySelector(".mod-image");
-        if (img) img.src = img.getAttribute("data-src") || img.src;
         fragment.appendChild(modView);
-        getFavsAndPlayCount(modView.getAttribute("mod-name"), modView);
+
+        // restart award cycling if needed
+        const trophyHolder = modView.querySelector(".trophy-holder");
+        if (trophyHolder) {
+          const lastIndex = parseInt(trophyHolder.dataset.cycleIndex) || 0;
+          cycleAwards(trophyHolder, lastIndex);
+        }
+
+        // register card with observer
+        metadataObserver.observe(modView);
       });
       modGrid.appendChild(fragment);
 
       if (loadingMessage) loadingMessage.style.display = 'none';
       if (checkbox) checkbox.disabled = false;
-    }, 0);
+    });
 
   } else {
     toggleFilterControls(false); // re-enable filters
@@ -1193,15 +1712,17 @@ function updateModViews(event) {
     const fragment = document.createDocumentFragment();
     pageMods.forEach((modView) => {
       modView.style.display = "flex";
-      // lazy load image only when visible
-      const img = modView.querySelector(".mod-image");
-      if (img) {
-        img.loading = "lazy";
-        img.src = img.getAttribute("data-src") || img.src;
-      }
       fragment.appendChild(modView);
-      // lazy load mod info
-      getFavsAndPlayCount(modView.getAttribute("mod-name"), modView);
+
+      // restart award cycling if needed
+      const trophyHolder = modView.querySelector(".trophy-holder");
+      if (trophyHolder) {
+        const lastIndex = parseInt(trophyHolder.dataset.cycleIndex) || 0;
+        cycleAwards(trophyHolder, lastIndex);
+      }
+
+      // register card with observer
+      metadataObserver.observe(modView);
     });
     modGrid.appendChild(fragment);
 
@@ -1254,13 +1775,19 @@ function renderPaginationControls(totalMods) {
   // page input
   const pageInputContainer = document.createElement("span");
   pageInputContainer.classList.add("pagination-input-container");
-  
+
   const pageInput = document.createElement("input");
   pageInput.type = "number";
   pageInput.min = "1";
   pageInput.max = totalPages;
   pageInput.value = currentPage;
+  pageInput.id = "pageInput";
   pageInput.classList.add("pagination-input");
+
+  const pageInputLabel = document.createElement("label");
+  pageInputLabel.setAttribute("for", "pageInput");
+  pageInputLabel.classList.add("sr-only");
+  pageInputLabel.textContent = "Page number";
 
   // go to page button
   const goButton = document.createElement("button");
@@ -1273,11 +1800,12 @@ function renderPaginationControls(totalMods) {
       updateModViews();
     } else {
       // resets new input to current input if new input is invalid page number
-      pageInput.value = currentPage; 
+      pageInput.value = currentPage;
     }
   });
 
   pageInputContainer.appendChild(pageInput);
+  pageInputContainer.appendChild(pageInputLabel);
   pageInputContainer.appendChild(goButton);
   paginationContainer.appendChild(pageInputContainer);
 
@@ -1336,6 +1864,9 @@ async function onChangeModSorter(e) {
       case "chrono":
         sortModViews(modCompare2);
         break;
+      case "chronoNew":
+        sortModViews((a, b) => modCompare2(b, a));
+        break;
       case "mostFav":
         sortModViews((a, b) => (b.dataset.favs ?? 0) - (a.dataset.favs ?? 0));
         break;
@@ -1359,20 +1890,12 @@ function sortModViews(comparisonFunction) {
   const visibleMods = getVisibleMods();
   visibleMods.sort(comparisonFunction);
 
-  const otherMods = modList.filter((mod) => !visibleMods.includes(mod));
+  const visibleSet = new Set(visibleMods);
+  const otherMods = modList.filter((mod) => !visibleSet.has(mod));
 
   // re-order the main modList
   modList.length = 0;
   modList.push(...visibleMods, ...otherMods);
-
-  const modGrid = document.getElementById("mod-grid");
-  // clear the mod grid and append the sorted views
-  while (modGrid.firstChild) {
-    modGrid.removeChild(modGrid.firstChild);
-  }
-  const fragment = document.createDocumentFragment();
-  modList.forEach((modView) => fragment.appendChild(modView));
-  modGrid.appendChild(fragment);
 
   currentPage = 1;
   updateModViews();
@@ -1423,7 +1946,7 @@ function toggleFavorite(event, modValue) {
 
   const span = event.currentTarget.querySelector("span");
   if (span) {
-    span.innerText = favText; // update the button text robustly
+    span.innerHTML = favText; // update the button text robustly
   }
   localStorage.setItem("favoriteMods", Array.from(favoriteMods));
   updateModViews();
@@ -1442,22 +1965,118 @@ async function loadModFromButton(modValue) {
   }
 
   loadingFromModButton = true;
-  e = campaignTrail_temp;
 
   if (customMods.has(modValue)) {
-    eval(localStorage.getItem(modValue + "_code1"));
+    // update URL for local mods
+    const pageURL = new URL(window.location.href);
+    pageURL.searchParams.delete("modName");
+    pageURL.searchParams.set("localMod", modValue);
+    window.history.replaceState(null, "", `${pageURL.pathname}?${pageURL.searchParams.toString().replaceAll("+", "%20")}`);
+
+    let modData = null;
+    try {
+      modData = await getModFromDB(modValue);
+    } catch (e) {
+      console.error("DB error:", e);
+    }
+
+    if (!modData || !modData.code1) {
+      alert(`Custom mod ${modValue} not found!`);
+      return;
+    }
+
+    extractModMetadata(modData.code1, modValue);
+
+    if (modData.code2) {
+      window.campaignTrail_temp = window.campaignTrail_temp || {};
+      window.campaignTrail_temp.custom_code_2 = modData.code2;
+    }
+
+    const execCtx = {
+      campaignTrail_temp,
+      window,
+      document,
+      $,
+      jQuery
+    };
+
+    try {
+      executeMod(modData.code1, execCtx);
+    } catch (e) {
+      console.error(`Failed to execute Code 1 for ${modValue}:`, e);
+      return;
+    }
+
     diff_mod = true;
     customMod = modValue;
+    window.customMod = modValue;
   } else {
-    if (!location.href.includes("?modName")) {
-      history.replaceState(null, "", "?modName=" + modValue);
+    const pageURL = new URL(window.location.href);
+
+    // ensure we switch params if moving from a local mod to an official one
+    if (pageURL.searchParams.has("localMod")) {
+      pageURL.searchParams.delete("localMod");
+    }
+
+    if (!pageURL.searchParams.has("modName") || pageURL.searchParams.get("modName") !== modValue) {
+      pageURL.searchParams.set("modName", modValue);
+      window.history.replaceState(null, "", `${pageURL.pathname}?${pageURL.searchParams.toString().replaceAll("+", "%20")}`);
     }
 
     try {
       const res = await fetch(`../static/mods/${modValue}_init.html`);
+      if (!res.ok) throw new Error("Network response was not ok");
       const modCode = await res.text();
-      eval(modCode);
+
+      extractModMetadata(modCode, modValue);
+
+      // fetch achievements for linked mods if they aren't already loaded
+      let linkedMods = [modValue];
+      if (typeof expandFavoriteSet === 'function') {
+        linkedMods = Array.from(expandFavoriteSet(new Set([modValue])));
+      } else if (modValue === "2024" || modValue === "2024 Divided States") {
+        linkedMods = ["2024", "2024 Divided States"];
+      }
+
+      // update display name if it's not already in the cache
+      function updateDisplayNameFromCode(code, value) {
+        if (!namesOfModsFromValue[value]) {
+          const temp = extractElectionDetails(code, value);
+          if (temp?.election_json?.length > 0 && temp.election_json[0].fields) {
+            namesOfModsFromValue[value] = temp.election_json[0].fields.display_name || temp.election_json[0].fields.title || value;
+          }
+        }
+      }
+
+      updateDisplayNameFromCode(modCode, modValue);
+
+      for (const linkedMod of linkedMods) {
+        if (linkedMod === modValue) continue;
+
+        if (!allAch[linkedMod]) {
+          try {
+            const linkedRes = await fetch(`../static/mods/${linkedMod}_init.html`);
+            if (linkedRes.ok) {
+              const linkedCode = await linkedRes.text();
+              extractModMetadata(linkedCode, linkedMod);
+              updateDisplayNameFromCode(linkedCode, linkedMod);
+            }
+          } catch (e) {
+            console.error(`Error loading linked achievements for ${linkedMod}:`, e);
+          }
+        }
+      }
+
+      executeMod(modCode, {
+        campaignTrail_temp,
+        window,
+        document,
+        $,
+        jQuery
+      });
       diff_mod = true;
+      customMod = false;
+      window.customMod = false;
     } catch (error) {
       console.error(`Failed to load mod ${modValue}:`, error);
       alert(`Failed to load mod ${modValue}. See console for details.`);
@@ -1469,8 +2088,8 @@ async function loadModFromButton(modValue) {
     customThemesButton.style.display = "none";
   }
 
-  $("#modloaddiv")[0].style.display = "none";
-  $("#modLoadReveal")[0].style.display = "none";
+  document.getElementById("modloaddiv").style.display = "none";
+  document.getElementById("modLoadReveal").style.display = "none";
   document.getElementById("featured-mods-area").style.display = "none";
   modded = true;
 
@@ -1478,8 +2097,8 @@ async function loadModFromButton(modValue) {
 
   if (!customMods.has(modValue)) {
     document.getElementById("copyLinkButton").style.display = "block";
-    document.getElementById("goBackButton").style.display = "inline";
   }
+  document.getElementById("goBackButton").style.display = "inline";
 
   const announcement = document.getElementById("announcement");
   if (announcement) {
@@ -1487,18 +2106,19 @@ async function loadModFromButton(modValue) {
   }
 
   setTimeout(() => updateModViewCount(modValue), 10000);
-  window.scrollTo(0, 0); // Scroll to top
+  window.scrollTo(0, 0);
 }
 
 async function copyModLink() {
-  let modLink = document.location.href;
+  const modLink = new URL(window.location.href);
 
-  if (!modLink.includes("?modName")) {
-    modLink = modLink + "?modName=" + modBeingPlayed.replaceAll(" ", "%20");
+  if (!modLink.searchParams.has("modName")) {
+    modLink.searchParams.set("modName", modBeingPlayed);
+    window.history.replaceState(null, "", `${modLink.pathname}?${modLink.searchParams.toString().replaceAll("+", "%20")}`);
   }
 
   try {
-    await window.navigator.clipboard.writeText(modLink);
+    await window.navigator.clipboard.writeText(modLink.href);
     alert("Copied link to clipboard!");
   } catch (err) {
     console.error("Failed to copy: ", err);
@@ -1516,30 +2136,33 @@ async function updateModViewCount(modName) {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ modName: modName }),
+      body: JSON.stringify({ modName }),
     });
   } catch (error) {
     console.error(`Failed to update play count for ${modName}:`, error);
   }
 }
 
-function getAllIndexes(arr, val) {
-  const indexes = [];
-  for (let i = 0; i < arr.length; i++) {
-    if (arr[i] === val) {
-      indexes.push(i);
-    }
-  }
-  return indexes;
-}
-
 async function loadEntries() {
   try {
     const modListResponse = await fetch("../static/mods/MODLOADERFILE.html");
     const modListHTML = await modListResponse.text();
-    $("#modSelect").html(modListHTML);
-    //clone so we don't reduce the list of mods every time a tag is selected
-    originalOptions = $("#modSelect option").clone();
+
+    // parse the HTML string into lightweight virtual elements
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(modListHTML, "text/html");
+    const options = doc.querySelectorAll("option");
+
+    // map elements to JS objects
+    originalModsData = Array.from(options).map(opt => ({
+      value: opt.value,
+      text: opt.textContent.trim(),
+      mode: opt.dataset.mode || "",
+      tags: opt.dataset.tags || "",
+      awards: opt.dataset.awards || "",
+      awardimageurls: opt.dataset.awardimageurls || ""
+    }));
+
     filterEntries();
   } catch (error) {
     console.error("Failed to load mod entries:", error);
@@ -1547,35 +2170,45 @@ async function loadEntries() {
 }
 
 function filterEntries() {
-  var selectedTags = [];
+  const selectedTags = [];
 
-  // Get all selected tags
-  $(".tagCheckbox:checked").each(function () {
-    selectedTags.push($(this).val());
+  // get all selected tags
+  document.querySelectorAll(".tagCheckbox:checked").forEach(checkbox => {
+    selectedTags.push(checkbox.value);
   });
 
-  var filteredOptions = originalOptions.filter(function () {
-    var entryTags = $(this).data("tags");
-
+  // filter the lightweight objects array
+  const filteredData = originalModsData.filter(entry => {
     if (selectedTags.length === 0) {
-      // Show all if no tags are selected
       return true;
     }
-
-    //return mods that are tagged and have all checked tags
-    return entryTags && containsAllTags(entryTags, selectedTags);
+    return entry.tags && containsAllTags(entry.tags, selectedTags);
   });
 
-  var $modSelect = $("#modSelect");
-  $modSelect.empty();
+  const selectElement = document.getElementById("modSelect");
 
+  // clear the select dropdown
+  selectElement.replaceChildren();
+
+  // re-build option elements
   const fragment = document.createDocumentFragment();
-  filteredOptions.each(function () {
-    fragment.appendChild(this);
+  filteredData.forEach(data => {
+    const opt = document.createElement("option");
+    opt.value = data.value;
+    opt.textContent = data.text;
+    opt.dataset.mode = data.mode;
+    opt.dataset.tags = data.tags;
+    opt.dataset.awards = data.awards;
+    opt.dataset.awardimageurls = data.awardimageurls;
+    fragment.appendChild(opt);
   });
-  $modSelect[0].appendChild(fragment);
 
-  $modSelect.val($modSelect.find("option:first").val());
+  selectElement.appendChild(fragment);
+
+  // set selected value to the first available option
+  if (selectElement.options.length > 0) {
+    selectElement.value = selectElement.options[0].value;
+  }
 }
 
 function containsAllTags(entryTags, selectedTags) {
@@ -1604,16 +2237,6 @@ function modCompare2(a, b) {
     return -1;
   }
   if (nameA > nameB) {
-    return 1;
-  }
-  return 0;
-}
-
-function modCompare(a, b) {
-  if (a.mod.value < b.mod.value) {
-    return -1;
-  }
-  if (a.mod.value > b.mod.value) {
     return 1;
   }
   return 0;
